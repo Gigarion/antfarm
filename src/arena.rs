@@ -68,6 +68,29 @@ pub const ARENA_WIDTH_TILES : u32 = 200;
 pub const ARENA_HEIGHT_TILES : u32 = 100;
 pub const ARENA_TILE_SIDE : f32 = 8.;
 
+pub struct ArenaPlugin;
+
+impl Plugin for ArenaPlugin {
+    fn build(&self, app: &mut App) {
+        app
+            .insert_resource(WindowDescriptor {
+                title: "Ant Farm".to_string(),
+                width: 1600.,
+                height: 850.,
+                ..Default::default()
+            })
+            .insert_resource(ArenaStats::default())
+            .insert_resource(ClearColor(Color::rgb(0.04, 0.04, 0.04)))
+            .add_startup_system(update_window_stats.label(StartupLabels::Screen))
+            .add_startup_system(startup_spawn_arena.after(StartupLabels::Screen))
+            .add_startup_system(setup_camera)
+            .add_system(size_scaling)
+            .add_system(position_translation)
+            .add_system(layer_fixer)
+            .add_system(update_window_stats);
+    }
+}
+
 fn update_window_stats(
     windows: Res<Windows>,
     mut screen_builder: ResMut<ArenaStats>
@@ -133,28 +156,7 @@ pub enum StartupLabels {
     Screen,
 }
 
-pub struct ArenaPlugin;
 
-impl Plugin for ArenaPlugin {
-    fn build(&self, app: &mut App) {
-        app
-            .insert_resource(WindowDescriptor {
-                title: "Ant Farm".to_string(),
-                width: 850.,
-                height: 850.,
-                ..Default::default()
-            })
-            .insert_resource(ArenaStats::default())
-            .insert_resource(ClearColor(Color::rgb(0.04, 0.04, 0.04)))
-            .add_startup_system(update_window_stats.label(StartupLabels::Screen))
-            .add_startup_system(startup_spawn_arena.after(StartupLabels::Screen))
-            .add_startup_system(setup_camera)
-            .add_system(size_scaling)
-            .add_system(position_translation)
-            .add_system(layer_fixer)
-            .add_system(update_window_stats);
-    }
-}
 
 fn startup_spawn_arena(
     mut commands: Commands,

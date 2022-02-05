@@ -100,44 +100,55 @@ fn clean_food(
 }
 
 fn ant_begin_ai(
+    time: Res<Time>,
     mut commands: Commands,
-    unassigned_ants: Query<Entity, (With<Ant>, Without<AntEating>, Without<AntMoving>)>,
+    unassigned_ants: Query<Entity, (With<Ant>, Without<AntEating>, Without<AntAI>)>,
+    mut ais: Query<&mut AntAI, With<Ant>>,
 ) {
     for ant in unassigned_ants.iter() {
-        commands.entity(ant).insert(AntMoving::default());
+        commands.entity(ant).insert(AntAI::default());
+    }
+
+    let dt = time.delta_seconds();
+    for mut ai in ais.iter_mut() {
+
+        // Handle special AI first
+        match ai.ai {
+            // Need to set
+            AiGoal::None => {
+                *ai = AntAI::random_move_ai();
+            },
+            // Remain until explicitly cleared
+            AiGoal::Wait | AiGoal::Destination{..} => continue,
+            _ => (),
+        }
+
+        // Now do duration
+        if ai.duration > 0. {
+            ai.duration -= dt;
+        }
+        if ai.duration <= 0. {
+            *ai = AntAI::random_move_ai();
+        }
     }
 }
 
-fn pick_move_ai() -> MoveAI {
-    let mut rng = thread_rng();
-    match rng.gen_range(0, 8) {
-        0 => MoveAI::North,
-        1 => MoveAI::South,
-        2 => MoveAI::East,
-        3 => MoveAI::West,
-        4 => MoveAI::NE,
-        5 => MoveAI::SE,
-        6 => MoveAI::SW,
-        7 => MoveAI::NW,
-        _ => MoveAI::Random,
-    }
-}
 
 fn ant_movement(
     time: Res<Time>,
     mut q: QuerySet<(
-        QueryState<(&Position, &Size), (With<Ant>, With<AntMoving>)>, // ant positions for filtering colliders
+        QueryState<(&Position, &Size), With<Ant>>, // ant positions for filtering colliders
         QueryState<(&Position, &Size), With<Collides>>, // possible colliders
-        QueryState<(&mut Position, &Size, Option<&Destination>, &mut AntMoving, Option<&Queen>), With<Ant>>, // ant positions for moving the ants
+        QueryState<(&mut Position, &Size, &mut AntAI, Option<&Queen>), With<Ant>>, // ant positions for moving the ants
     )>,
 ) {
 
     let dt = time.delta_seconds();
     let d_r = dt * ANT_SPEED;
 
-    let ant_start: Vec<(Position, Size)> = q.q0().iter()
-        .map(|(p, s)| (*p, *s)).collect();
+    let ant_start: Vec<(Position, Size)> = q.q0().iter().map(|(p, s)| (*p, *s)).collect();
 
+    // Trim occupied down to only things within 2 move spaces.
     let occupied: Vec<(Position, Size)> = q.q1().iter()
         .filter(|(p_obj, s_obj)| {
             ant_start.iter()
@@ -148,7 +159,7 @@ fn ant_movement(
         .map(|(p, s)| (*p, *s))
         .collect();
 
-    for (mut pos, size, opt_dest, mut ai, opt_queen) in q.q2().iter_mut() {
+    for (mut pos, size, ai, opt_queen) in q.q2().iter_mut() {
 
         let d_r = if opt_queen.is_some() {
             dt * QUEEN_SPEED
@@ -156,29 +167,27 @@ fn ant_movement(
             d_r
         };
 
-        // We have a destination, let's go there
-        if let Some(dest) = opt_dest {
-            let start =  Vec2::from((pos.x, pos.y));
-            let target = Vec2::from((dest.location.x, dest.location.y));
-            let lerp_frac = d_r / start.distance(target);
-            let outcome = start.lerp(target, lerp_frac);
+        match ai.ai {
+            // We have a goal, go to it
+            AiGoal::Destination{dest} => {
+                let start =  Vec2::from((pos.x, pos.y));
+                let target = Vec2::from((dest.x, dest.y));
+                let lerp_frac = d_r / start.distance(target);
+                let outcome = start.lerp(target, lerp_frac);
 
-            // if no collision take it
-            if !occupied.iter().any(|(p_1, s_1)| collides(&pos, size, p_1, s_1)) {
-                pos.x = outcome.x;
-                pos.y = outcome.y;
-                continue;
-            }
-            // else fall back to random walk
-        }
+                // if no collision take it
+                if !occupied.iter().any(|(p_1, s_1)| collides(&pos, size, p_1, s_1)) {
+                    pos.x = outcome.x;
+                    pos.y = outcome.y;
+                    continue;
+                }
+            },
 
-        if ai.duration > 0. {
-            ai.duration -= dt;
-        }
+            // We need to stay here. Do so.
+            AiGoal::None | AiGoal:: Wait => continue,
 
-        if ai.ai.is_none() || ai.duration < 0. {
-            ai.duration = 5.0;
-            ai.ai = Some(pick_move_ai());
+            // Everything else has a movement
+            _ => {},
         }
 
         // We don't have a destination, random walk
@@ -193,7 +202,7 @@ fn ant_movement(
             Position {x: pos.x - d_r, y: pos.y + d_r}   // NW
         );
 
-        let weights = generate_move_weights(ai.ai.unwrap());
+        let weights = generate_move_weights(ai.ai);
 
         let max_width = ARENA_TILE_SIDE * ARENA_WIDTH_TILES as f32;
         let max_height = ARENA_TILE_SIDE * ARENA_HEIGHT_TILES as f32;
@@ -207,10 +216,15 @@ fn ant_movement(
             .collect();
 
         let outcome_vec: Vec<Position> = possibles.iter().map(|(p, _)| *p).collect();
-        if outcome_vec.len() > 0 {
+        // short-circuit to avoid the rng
+        if outcome_vec.len() == 1 {
+            pos.x = outcome_vec[0].x;
+            pos.y = outcome_vec[0].y;
+        } else if outcome_vec.len() > 0 {
+            // AI weighted distribution
             let weight_vec: Vec<i32> = possibles.iter().map(|(_, w)| *w).collect();
             let dist = WeightedIndex::new(weight_vec).unwrap();
-            // let dir = 0; // number 0 -> 4
+
             let mut rng = thread_rng();
             let newpos  = outcome_vec[dist.sample(&mut rng)];
             pos.x = newpos.x;
@@ -221,17 +235,18 @@ fn ant_movement(
     }
 }
 
-fn generate_move_weights(ai: MoveAI) -> Vec<i32> {
+fn generate_move_weights(ai: AiGoal) -> Vec<i32> {
     match ai {
-        MoveAI::North =>  vec![16, 4, 1, 4, 8, 1, 1, 8],
-        MoveAI::East =>   vec![4, 16, 4, 1, 8, 8, 1, 1],
-        MoveAI::South =>  vec![1, 4, 16, 4, 1, 8, 8, 1],
-        MoveAI::West =>   vec![4, 1, 4, 16, 1, 1, 8, 8],
-        MoveAI::NE =>     vec![4, 4, 1, 1, 16, 1, 1, 1],
-        MoveAI::SE =>     vec![1, 4, 4, 1, 1, 16, 1, 1],
-        MoveAI::SW =>     vec![1, 1, 4, 4, 1, 1, 16, 1],
-        MoveAI::NW =>     vec![4, 1, 1, 4, 1, 1, 1, 16],
-        MoveAI::Random => vec![1, 1, 1, 1, 1, 1, 1, 1],
+        AiGoal::North =>  vec![16, 4, 1, 4, 8, 1, 1, 8],
+        AiGoal::East =>   vec![4, 16, 4, 1, 8, 8, 1, 1],
+        AiGoal::South =>  vec![1, 4, 16, 4, 1, 8, 8, 1],
+        AiGoal::West =>   vec![4, 1, 4, 16, 1, 1, 8, 8],
+        AiGoal::NE =>     vec![4, 4, 1, 1, 16, 1, 1, 1],
+        AiGoal::SE =>     vec![1, 4, 4, 1, 1, 16, 1, 1],
+        AiGoal::SW =>     vec![1, 1, 4, 4, 1, 1, 16, 1],
+        AiGoal::NW =>     vec![4, 1, 1, 4, 1, 1, 1, 16],
+        AiGoal::Random | AiGoal::Destination{..} => vec![1, 1, 1, 1, 1, 1, 1, 1],
+        _ => panic!("Asked to select move weights for an unsupported goal {:?}", ai),
     }
 }
 
@@ -345,9 +360,9 @@ fn start_eat_food(
     mut commands: Commands,
     known_food: Res<KnownFood>,
     food_pos: Query<&Position, With<Food>>,
-    ants: Query<(Entity, &Hunger, &Position, &Size, &Destination), (With<Ant>, With<AntMoving>)>,
+    mut ants: Query<(Entity, &Position, &Size, &mut AntAI), With<FindFood>>,
 ) {
-    let available_food: Vec<(Position, Entity)> = known_food.locs.iter()
+    let mut available_food: Vec<(Position, Entity)> = known_food.locs.iter()
         .filter_map(|e| {
             match food_pos.get(*e) {
                 Ok(v) => Some((*v, *e)),
@@ -356,16 +371,26 @@ fn start_eat_food(
         })
         .collect();
 
-    for (e, h, p, s, dest) in ants.iter() {
-        for (food_p, food_ent) in available_food.iter() {
-            if h.pct < 0.5 && dist_between(p, s, food_p, &crate::arena::Size::square(0.5)) < 0.6 {
-                commands.entity(e).insert(AntEating{food_ent: *food_ent});
-                commands.entity(e).remove::<AntMoving>();
-                break;
+    for (e, p, s, mut ai) in ants.iter_mut() {
+        if let AiGoal::Destination{dest} = ai.ai {
+            if let Some((food_pos, food_ent)) = available_food
+                .iter_mut()
+                .filter(|(f_p, _)| {
+                    dest == *f_p
+                }).next()
+            {
+                if dist_between(p, s, &food_pos, &crate::arena::Size::square(0.5)) < 0.6 {
+                    println!("adding AntEating");
+                    commands.entity(e).insert(AntEating{food_ent: *food_ent});
+                    commands.entity(e).remove::<FindFood>();
+                    ai.ai = AiGoal::Wait;
+                    break;
+                }
+            } else {
+                // This isn't the food you're looking for, try for another food goal
+                *ai = AntAI::default();
+                commands.entity(e).remove::<FindFood>();
             }
-        }
-        if dist_between(p, s, &dest.location,&crate::arena::Size::square(0.5)) < 0.6 {
-            commands.entity(e).remove::<Destination>();
         }
     }
 }
@@ -380,6 +405,14 @@ fn eat_food(
     let dt = time.delta_seconds();
     for (mut h, eating, e) in eating_ants.iter_mut() {
         if let Ok(mut food) = food.get_mut(eating.food_ent) {
+            // First food check to avoid double-despawning the food.  We've already
+            // despawned it if we see negative before eating any ourselves.
+            if food.quantity <= 0. {
+                commands.entity(e).insert(AntAI::default());
+                commands.entity(e).remove::<AntEating>();
+                continue;
+            }
+
             if h.pct < 1.0 && food.quantity > 0. {
                 h.pct += dt * EAT_RATE;
                 food.quantity -= dt * EAT_RATE;
@@ -387,23 +420,20 @@ fn eat_food(
 
             if food.quantity <= 0. {
                 commands.entity(eating.food_ent).despawn();
-                commands.entity(e).insert(AntMoving::default());
+                commands.entity(e).insert(AntAI::default());
                 commands.entity(e).remove::<AntEating>();
-                commands.entity(e).remove::<Destination>();
                 println!("Food gone");
             }
 
             if h.pct > 1.0 {
                 h.pct = 1.0;
-                commands.entity(e).insert(AntMoving::default());
+                commands.entity(e).insert(AntAI::default());
                 commands.entity(e).remove::<AntEating>();
-                commands.entity(e).remove::<Destination>();
                 println!("Done eating");
             }
         } else {
             commands.entity(e).remove::<AntEating>();
-            commands.entity(e).remove::<Destination>();
-            commands.entity(e).insert(AntMoving::default());
+            commands.entity(e).insert(AntAI::default());
         }
     }
 }
@@ -413,10 +443,10 @@ fn add_food_goal(
     mut commands: Commands,
     known_food: Res<KnownFood>,
     food_pos: Query<&Position, With<Food>>,
-    ants: Query<(Entity, &Position, &Size, &Hunger), (With<Ant>, Without<Destination>)>,
+    ants: Query<(Entity, &Position, &Size, &Hunger), (With<Ant>, Without<FindFood>, Without<AntEating>)>,
 ) {
     for (e, ant_pos, ant_size,  hunger) in ants.iter() {
-        if hunger.pct < 0.2 && !known_food.locs.is_empty() {
+        if hunger.pct < 0.22 && !known_food.locs.is_empty() {
             let mut max_dist: f32 = 1000000.;
             let mut best = known_food.locs[0];
             for food in known_food.locs.iter() {
@@ -431,8 +461,12 @@ fn add_food_goal(
 
             // Select destination food:
             if let Ok(food_place) = food_pos.get(best) {
-                commands.entity(e).insert(Destination {
-                    location: *food_place,
+                commands.entity(e).insert(FindFood);
+                commands.entity(e).insert(AntAI {
+                    ai: AiGoal::Destination {
+                        dest: *food_place,
+                    },
+                    duration: 100000.,
                 });
             }
         }
@@ -561,18 +595,16 @@ impl VisibleRange {
     }
 }
 
-#[derive(Component)]
-struct Destination {
-    pub location: Position,
-}
+#[derive(Component, Clone, Copy, PartialEq, PartialOrd)]
+struct FindFood;
 
 #[derive(Component, PartialEq, PartialOrd)]
 struct AntEating {
     food_ent: Entity,
 }
 
-#[derive(Clone, Copy)]
-enum MoveAI {
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AiGoal {
     North,
     South,
     East,
@@ -582,10 +614,46 @@ enum MoveAI {
     SW,
     NW,
     Random,
+    Destination {
+        dest: Position,
+    },
+    Wait,
+    None,
 }
 
-#[derive(Component, Default)]
-struct AntMoving {
-    ai: Option<MoveAI>,
+#[derive(Component)]
+struct AntAI {
+    ai: AiGoal,
     duration: f32,
+}
+
+impl Default for AntAI {
+    fn default() -> Self {
+        AntAI {
+            ai: AiGoal::None,
+            duration: 0.0,
+        }
+    }
+}
+
+impl AntAI {
+    fn random_move_ai() -> AntAI {
+        let mut rng = thread_rng();
+        let ai = match rng.gen_range(0, 8) {
+            0 => AiGoal::North,
+            1 => AiGoal::South,
+            2 => AiGoal::East,
+            3 => AiGoal::West,
+            4 => AiGoal::NE,
+            5 => AiGoal::SE,
+            6 => AiGoal::SW,
+            7 => AiGoal::NW,
+            _ => AiGoal::Random,
+        };
+
+        AntAI {
+            ai,
+            duration: 5.0,
+        }
+    }
 }
